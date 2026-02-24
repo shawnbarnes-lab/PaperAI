@@ -9,14 +9,12 @@ import io.objectbox.annotation.VectorDistanceType
  * DocumentChunk represents a single chunk of text from a document, along with its
  * vector embedding for similarity search.
  *
- * In RAG (Retrieval Augmented Generation), we don't store entire documents as-is.
- * Instead, we break them into smaller "chunks" (typically 200-500 words each).
- * Each chunk gets converted into a vector (a list of 384 numbers) that captures
- * its semantic meaning. When a user searches, we convert their query to a vector
- * and find chunks with similar vectors.
- *
- * The @Entity annotation tells ObjectBox this class should be stored in the database.
- * ObjectBox will automatically create a table for DocumentChunk objects.
+ * CHANGES FROM ORIGINAL:
+ * - Added originalFilePath for opening the source PDF/TXT directly
+ * - Added chunkIndex for ordering chunks within a document
+ * - Added totalChunks so the UI knows the full document scope
+ * - Added sectionTitle for better context display
+ * - Similarity remains @Transient (not persisted, computed at search time)
  */
 @Entity
 data class DocumentChunk(
@@ -31,6 +29,9 @@ data class DocumentChunk(
     /**
      * The actual text content of this chunk. This is what we show to the user
      * as "source material" and what we feed to the LLM as context.
+     *
+     * With the improved chunking strategy, chunks are now 400-500 words and
+     * always break on paragraph boundaries — never mid-sentence.
      */
     var text: String = "",
 
@@ -47,23 +48,43 @@ data class DocumentChunk(
     var sourceName: String = "",
 
     /**
-     * The vector embedding - this is the magic that makes semantic search work!
-     *
-     * The all-MiniLM-L6-v2 model converts text into 384 numbers (dimensions).
-     * These numbers encode the "meaning" of the text in a way that similar
-     * texts have similar numbers. We can then use cosine similarity to find
-     * chunks that are semantically similar to a user's query.
+     * Path to the original file in app-internal storage.
+     * Used to open the actual PDF/TXT when the user taps "View Original".
+     * Populated during import: e.g. "/data/data/com.tensorspace.paperai/files/docs/survival_guide.pdf"
+     */
+    var originalFilePath: String = "",
+
+    /**
+     * Zero-based index of this chunk within its source document.
+     * Used for ordering chunks sequentially and for computing context windows (±N chunks).
+     */
+    var chunkIndex: Int = 0,
+
+    /**
+     * Total number of chunks in the source document.
+     * Lets the UI show progress like "Section 3 of 47".
+     */
+    var totalChunks: Int = 0,
+
+    /**
+     * Section or chapter title extracted during chunking (if available).
+     * For PDFs: heading text detected near the chunk.
+     * For TXT: first line if it looks like a heading, otherwise empty.
+     */
+    var sectionTitle: String = "",
+
+    /**
+     * The vector embedding — 384-dim float array from all-MiniLM-L6-v2.
      *
      * @HnswIndex tells ObjectBox to build a special index (HNSW = Hierarchical
      * Navigable Small World) that makes vector searches extremely fast, even
-     * with millions of vectors. Without this index, we'd have to compare against
-     * every single vector, which would be slow.
+     * with millions of vectors.
      *
-     * Parameters explained:
-     * - dimensions = 384: The size of our vectors (must match the embedding model)
-     * - distanceType = COSINE: How to measure similarity (cosine is standard for text)
-     * - neighborsPerNode = 30: HNSW tuning - more neighbors = better accuracy, slower indexing
-     * - indexingSearchCount = 200: HNSW tuning - higher = better index quality, slower build
+     * Parameters:
+     * - dimensions = 384: Must match the embedding model output size
+     * - distanceType = COSINE: Standard for text similarity
+     * - neighborsPerNode = 30: More = better accuracy, slower indexing
+     * - indexingSearchCount = 200: Higher = better index quality, slower build
      */
     @HnswIndex(
         dimensions = 384,
@@ -73,6 +94,10 @@ data class DocumentChunk(
     )
     var embedding: FloatArray = FloatArray(384),
 
+    /**
+     * Cosine similarity score computed at search time.
+     * Not persisted to the database — only populated in search results.
+     */
     @io.objectbox.annotation.Transient
     var similarity: Float = 0f
 )

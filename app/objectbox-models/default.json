@@ -5,7 +5,7 @@
   "entities": [
     {
       "id": "1:778474571083380376",
-      "lastPropertyId": "5:2141132834167617074",
+      "lastPropertyId": "9:1979574241863095491",
       "name": "DocumentChunk",
       "properties": [
         {
@@ -35,6 +35,26 @@
           "indexId": "1:1966313500824480303",
           "type": 28,
           "flags": 8
+        },
+        {
+          "id": "6:5068221708496834881",
+          "name": "originalFilePath",
+          "type": 9
+        },
+        {
+          "id": "7:6918803541167640365",
+          "name": "chunkIndex",
+          "type": 5
+        },
+        {
+          "id": "8:719128467154007280",
+          "name": "totalChunks",
+          "type": 5
+        },
+        {
+          "id": "9:1979574241863095491",
+          "name": "sectionTitle",
+          "type": 9
         }
       ],
       "relations": []

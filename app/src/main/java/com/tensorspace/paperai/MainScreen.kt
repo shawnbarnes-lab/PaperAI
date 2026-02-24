@@ -3,11 +3,14 @@ package com.tensorspace.paperai
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -26,6 +29,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -37,6 +41,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 
 /**
  * MainScreen is the primary UI for paperAI.
+ *
+ * CHANGES FROM ORIGINAL:
+ * - ResponseTab now shows brief summary + source passages (hybrid layout)
+ * - SourcesTab cards show context window (±2 chunks) on expand
+ * - DocumentViewerDialog uses proximity-based opacity for context chunks
+ * - Added ExpandableSourceCard with inline context viewer
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,22 +60,22 @@ fun MainScreen(
     val serverUrl by viewModel.serverUrl.collectAsState()
     val uploadProgress by viewModel.uploadProgress.collectAsState()
     val serverStatus by viewModel.serverStatus.collectAsState()
-    
+
     // State for document viewer dialog
     var selectedDocument by remember { mutableStateOf<String?>(null) }
     var documentChunks by remember { mutableStateOf<List<DocumentChunk>>(emptyList()) }
     var highlightedChunkId by remember { mutableStateOf<Long?>(null) }
-    
+
     // State for server settings dialog
     var showServerDialog by remember { mutableStateOf(false) }
-    
+
     // File picker for importing .paperai files (local import)
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let { viewModel.importVectors(it) }
     }
-    
+
     // File picker for uploading documents to server
     val uploadPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -79,14 +89,14 @@ fun MainScreen(
             documentName = selectedDocument!!,
             chunks = documentChunks,
             highlightedChunkId = highlightedChunkId,
-            onDismiss = { 
+            onDismiss = {
                 selectedDocument = null
                 documentChunks = emptyList()
                 highlightedChunkId = null
             }
         )
     }
-    
+
     // Show server settings dialog
     if (showServerDialog) {
         ServerSettingsDialog(
@@ -97,7 +107,7 @@ fun MainScreen(
             onDismiss = { showServerDialog = false }
         )
     }
-    
+
     // Show upload progress dialog
     uploadProgress?.let { progress ->
         UploadProgressDialog(
@@ -105,7 +115,7 @@ fun MainScreen(
             onCancel = { viewModel.cancelUpload() }
         )
     }
-    
+
     // Show import result snackbar
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(importResult) {
@@ -142,7 +152,7 @@ fun MainScreen(
                 actions = {
                     // Upload to server button
                     IconButton(
-                        onClick = { 
+                        onClick = {
                             uploadPickerLauncher.launch(arrayOf("text/plain", "application/pdf", "*/*"))
                         },
                         enabled = uiState.isEngineReady && !uiState.isLoading && uploadProgress == null
@@ -192,8 +202,6 @@ fun MainScreen(
                     onTabSelected = viewModel::onTabSelected,
                     uiState = uiState,
                     onSourceClick = { chunk ->
-                        // Load all chunks for this document and show dialog
-                        // Pass the clicked chunk's ID so we can highlight it
                         selectedDocument = chunk.sourceName
                         documentChunks = viewModel.getDocumentChunks(chunk.sourceName)
                         highlightedChunkId = chunk.id
@@ -211,6 +219,10 @@ fun MainScreen(
         }
     }
 }
+
+// =============================================================================
+// STATUS BAR
+// =============================================================================
 
 @Composable
 fun StatusBar(uiState: UiState) {
@@ -254,6 +266,10 @@ fun StatusBar(uiState: UiState) {
         }
     }
 }
+
+// =============================================================================
+// SEARCH BAR
+// =============================================================================
 
 @Composable
 fun SearchBar(
@@ -328,6 +344,10 @@ fun SearchBar(
     }
 }
 
+// =============================================================================
+// TAB SECTION — AI Response + Sources
+// =============================================================================
+
 @Composable
 fun TabSection(
     selectedTab: Int,
@@ -363,6 +383,10 @@ fun TabSection(
     }
 }
 
+// =============================================================================
+// RESPONSE TAB — Now shows hybrid: brief summary + source passages
+// =============================================================================
+
 @Composable
 fun ResponseTab(uiState: UiState) {
     val response = uiState.lastResponse
@@ -387,6 +411,7 @@ fun ResponseTab(uiState: UiState) {
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
             ) {
+                // Query echo
                 Text(
                     text = "You asked: \"${response.query}\"",
                     style = MaterialTheme.typography.bodySmall,
@@ -395,25 +420,88 @@ fun ResponseTab(uiState: UiState) {
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer
-                    )
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = "AI Response",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                // Brief summary card (if LLM produced one)
+                val briefSummary = response.briefSummary
+                if (briefSummary != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer
                         )
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "AI Summary",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = briefSummary,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+
+                // Key source passages
+                val sources = response.sources
+                if (sources.isNotEmpty()) {
+                    Text(
+                        text = "📖 Key Passages",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    sources.take(3).forEachIndexed { index, chunk ->
+                        SourcePassageCard(
+                            index = index + 1,
+                            chunk = chunk
+                        )
+                        if (index < minOf(2, sources.lastIndex)) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                    }
+
+                    if (sources.size > 3) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = response.response,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                            text = "${sources.size - 3} more matching sections in Sources tab →",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontStyle = FontStyle.Italic
                         )
+                    }
+                }
+
+                // Fallback: show full response text if no brief summary
+                if (briefSummary == null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "AI Response",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = response.answer,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
                     }
                 }
 
@@ -430,8 +518,46 @@ fun ResponseTab(uiState: UiState) {
 }
 
 /**
- * Format processing time for display.
+ * Compact source passage card shown in the AI Response tab.
+ * Shows a truncated preview of the matched chunk with source info.
  */
+@Composable
+fun SourcePassageCard(
+    index: Int,
+    chunk: DocumentChunk
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            // Preview text (first 200 chars)
+            val preview = chunk.text.take(200).let {
+                if (chunk.text.length > 200) "$it..." else it
+            }
+            Text(
+                text = "[$index] $preview",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            // Source attribution
+            val source = if (chunk.sectionTitle.isNotBlank()) {
+                "${chunk.sourceName} — ${chunk.sectionTitle}, p.${chunk.pageNumber}"
+            } else {
+                "${chunk.sourceName}, p.${chunk.pageNumber}"
+            }
+            Text(
+                text = source,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                fontStyle = FontStyle.Italic
+            )
+        }
+    }
+}
+
 fun formatProcessingTime(timeMs: Long): String {
     return when {
         timeMs < 1000 -> "${timeMs}ms"
@@ -439,12 +565,17 @@ fun formatProcessingTime(timeMs: Long): String {
     }
 }
 
+// =============================================================================
+// SOURCES TAB — Now with expandable context windows
+// =============================================================================
+
 @Composable
 fun SourcesTab(
     uiState: UiState,
     onSourceClick: (DocumentChunk) -> Unit = {}
 ) {
     val sources = uiState.lastResponse?.sources ?: emptyList()
+    val contextChunks = uiState.lastResponse?.contextChunks ?: emptyMap()
 
     if (uiState.isSearching) {
         Box(
@@ -476,24 +607,35 @@ fun SourcesTab(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             items(sources) { chunk ->
-                SourceCard(
+                ExpandableSourceCard(
                     chunk = chunk,
-                    onClick = { onSourceClick(chunk) }
+                    contextWindow = contextChunks[chunk.id] ?: emptyList(),
+                    onViewDocument = { onSourceClick(chunk) }
                 )
             }
         }
     }
 }
 
+/**
+ * Expandable source card — shows the matched chunk, and expands to show
+ * ±2 surrounding chunks as context when tapped.
+ *
+ * This solves the "chunks are cut off" problem without needing to open the
+ * full document viewer. Users can see surrounding paragraphs inline.
+ */
 @Composable
-fun SourceCard(
+fun ExpandableSourceCard(
     chunk: DocumentChunk,
-    onClick: () -> Unit = {}
+    contextWindow: List<DocumentChunk>,
+    onViewDocument: () -> Unit = {}
 ) {
+    var isExpanded by remember { mutableStateOf(false) }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable { isExpanded = !isExpanded },
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface
         ),
@@ -502,6 +644,7 @@ fun SourceCard(
         Column(
             modifier = Modifier.padding(16.dp)
         ) {
+            // Header: source name + relevance score
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -514,8 +657,13 @@ fun SourceCard(
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
+                    val pageInfo = if (chunk.sectionTitle.isNotBlank()) {
+                        "Page ${chunk.pageNumber} — ${chunk.sectionTitle}"
+                    } else {
+                        "Page ${chunk.pageNumber}"
+                    }
                     Text(
-                        text = "Page ${chunk.pageNumber}",
+                        text = pageInfo,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -537,39 +685,100 @@ fun SourceCard(
 
             Spacer(modifier = Modifier.height(12.dp))
 
+            // Matched chunk text
             Text(
                 text = chunk.text,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface
             )
 
+            // Expanded context window
+            if (isExpanded && contextWindow.size > 1) {
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "Surrounding Context",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                contextWindow.forEach { contextChunk ->
+                    if (contextChunk.id == chunk.id) return@forEach  // skip the match itself
+
+                    val isBefore = contextChunk.chunkIndex < chunk.chunkIndex ||
+                            (contextChunk.chunkIndex == 0 && contextChunk.pageNumber < chunk.pageNumber)
+                    val label = if (isBefore) "↑ Before" else "↓ After"
+
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                text = "$label (p.${contextChunk.pageNumber})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontStyle = FontStyle.Italic
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = contextChunk.text,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Footer: expand hint + view full doc
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = getRelevanceLabel(chunk.similarity),
+                    text = if (isExpanded) "Tap to collapse" else {
+                        val extraCount = contextWindow.size - 1
+                        if (extraCount > 0) "Tap to show $extraCount surrounding sections"
+                        else getRelevanceLabel(chunk.similarity)
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontStyle = FontStyle.Italic
                 )
-                Text(
-                    text = "Tap to view full document",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontStyle = FontStyle.Italic
-                )
+                TextButton(
+                    onClick = onViewDocument,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                ) {
+                    Text(
+                        text = "View full document →",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }
 }
 
+// =============================================================================
+// DOCUMENT VIEWER DIALOG — Improved with proximity-based opacity
+// =============================================================================
+
 /**
  * Full-screen dialog to view an entire document.
- * Highlights and auto-scrolls to the matched chunk.
+ * Highlights the matched chunk and uses proximity-based opacity
+ * so context chunks near the match are brighter, distant chunks are dimmer.
  */
 @Composable
 fun DocumentViewerDialog(
@@ -578,17 +787,26 @@ fun DocumentViewerDialog(
     highlightedChunkId: Long? = null,
     onDismiss: () -> Unit
 ) {
-    val sortedChunks = remember(chunks) { chunks.sortedBy { it.pageNumber } }
+    val sortedChunks = remember(chunks) {
+        chunks.sortedBy { it.chunkIndex.takeIf { idx -> idx > 0 } ?: it.pageNumber }
+    }
     val listState = rememberLazyListState()
-    
+
     // Auto-scroll to highlighted chunk when dialog opens
     LaunchedEffect(highlightedChunkId, sortedChunks) {
         if (highlightedChunkId != null) {
             val index = sortedChunks.indexOfFirst { it.id == highlightedChunkId }
             if (index >= 0) {
-                listState.animateScrollToItem(index)
+                // Scroll so the match is near the top with some leading context
+                val scrollTarget = (index - 1).coerceAtLeast(0)
+                listState.animateScrollToItem(scrollTarget)
             }
         }
+    }
+
+    // Compute the index of the highlighted chunk for proximity calculations
+    val highlightIndex = remember(highlightedChunkId, sortedChunks) {
+        sortedChunks.indexOfFirst { it.id == highlightedChunkId }
     }
 
     Dialog(
@@ -661,10 +879,26 @@ fun DocumentViewerDialog(
                             .padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        items(sortedChunks) { chunk ->
+                        itemsIndexed(sortedChunks) { index, chunk ->
+                            val isHighlighted = chunk.id == highlightedChunkId
+                            val distanceFromMatch = if (highlightIndex >= 0) {
+                                kotlin.math.abs(index - highlightIndex)
+                            } else {
+                                Int.MAX_VALUE
+                            }
+                            // Proximity-based opacity: match=1.0, ±1=0.85, ±2=0.7, rest=0.5
+                            val sectionAlpha = when (distanceFromMatch) {
+                                0 -> 1f
+                                1 -> 0.85f
+                                2 -> 0.7f
+                                else -> 0.5f
+                            }
+
                             DocumentSection(
                                 chunk = chunk,
-                                isHighlighted = chunk.id == highlightedChunkId
+                                isHighlighted = isHighlighted,
+                                isNearContext = distanceFromMatch in 1..2,
+                                alpha = sectionAlpha
                             )
                         }
                     }
@@ -674,17 +908,27 @@ fun DocumentViewerDialog(
     }
 }
 
+/**
+ * Individual document section within the document viewer.
+ * Now supports proximity-based visual treatment.
+ */
 @Composable
 fun DocumentSection(
     chunk: DocumentChunk,
-    isHighlighted: Boolean = false
+    isHighlighted: Boolean = false,
+    isNearContext: Boolean = false,
+    alpha: Float = 1f
 ) {
-    val backgroundColor = if (isHighlighted) {
-        MaterialTheme.colorScheme.tertiaryContainer
-    } else {
-        Color.Transparent
-    }
-    
+    val backgroundColor by animateColorAsState(
+        targetValue = when {
+            isHighlighted -> MaterialTheme.colorScheme.tertiaryContainer
+            isNearContext -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+            else -> Color.Transparent
+        },
+        animationSpec = tween(300),
+        label = "sectionBgColor"
+    )
+
     val borderColor = if (isHighlighted) {
         MaterialTheme.colorScheme.tertiary
     } else {
@@ -692,7 +936,9 @@ fun DocumentSection(
     }
 
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(alpha),
         shape = RoundedCornerShape(8.dp),
         color = backgroundColor,
         border = if (isHighlighted) {
@@ -707,16 +953,25 @@ fun DocumentSection(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Page ${chunk.pageNumber}",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isHighlighted) {
-                        MaterialTheme.colorScheme.onTertiaryContainer
-                    } else {
-                        MaterialTheme.colorScheme.primary
+                Column {
+                    Text(
+                        text = "Page ${chunk.pageNumber}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isHighlighted) {
+                            MaterialTheme.colorScheme.onTertiaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        }
+                    )
+                    if (chunk.sectionTitle.isNotBlank()) {
+                        Text(
+                            text = chunk.sectionTitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
-                )
+                }
                 if (isHighlighted) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
@@ -730,6 +985,13 @@ fun DocumentSection(
                             color = MaterialTheme.colorScheme.onTertiary
                         )
                     }
+                } else if (isNearContext) {
+                    Text(
+                        text = "CONTEXT",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontStyle = FontStyle.Italic
+                    )
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
@@ -742,13 +1004,17 @@ fun DocumentSection(
                     MaterialTheme.colorScheme.onSurface
                 }
             )
-            if (!isHighlighted) {
+            if (!isHighlighted && !isNearContext) {
                 Spacer(modifier = Modifier.height(8.dp))
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }
         }
     }
 }
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
 
 @Composable
 fun getRelevanceColor(score: Float): Color {
@@ -770,6 +1036,10 @@ fun getRelevanceLabel(score: Float): String {
         else -> "Low relevance"
     }
 }
+
+// =============================================================================
+// INITIALIZING + WELCOME VIEWS (unchanged from original)
+// =============================================================================
 
 @Composable
 fun InitializingView() {
@@ -820,7 +1090,6 @@ fun WelcomeView(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            // App icon/logo placeholder
             Surface(
                 modifier = Modifier.size(80.dp),
                 shape = RoundedCornerShape(20.dp),
@@ -833,9 +1102,9 @@ fun WelcomeView(
                     )
                 }
             }
-            
+
             Spacer(modifier = Modifier.height(24.dp))
-            
+
             Text(
                 text = "Your Knowledge,\nAlways Offline",
                 style = MaterialTheme.typography.headlineMedium,
@@ -858,8 +1127,7 @@ fun WelcomeView(
 
             if (!hasDocuments) {
                 Spacer(modifier = Modifier.height(32.dp))
-                
-                // How it works section
+
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp),
@@ -875,29 +1143,19 @@ fun WelcomeView(
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
                         )
-                        
+
                         Spacer(modifier = Modifier.height(12.dp))
-                        
-                        HowItWorksStep(
-                            number = "1",
-                            text = "Add your document (PDF)"
-                        )
+
+                        HowItWorksStep(number = "1", text = "Add your document (PDF)")
                         Spacer(modifier = Modifier.height(8.dp))
-                        HowItWorksStep(
-                            number = "2", 
-                            text = "We process it into a knowledge pack"
-                        )
+                        HowItWorksStep(number = "2", text = "We process it into a knowledge pack")
                         Spacer(modifier = Modifier.height(8.dp))
-                        HowItWorksStep(
-                            number = "3",
-                            text = "Ask questions anytime - no internet needed"
-                        )
+                        HowItWorksStep(number = "3", text = "Ask questions anytime - no internet needed")
                     }
                 }
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
-                
-                // Primary action - Add document
+
                 Button(
                     onClick = onUpload,
                     modifier = Modifier.fillMaxWidth(),
@@ -915,28 +1173,27 @@ fun WelcomeView(
                         style = MaterialTheme.typography.titleSmall
                     )
                 }
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
-                
+
                 HorizontalDivider(
                     modifier = Modifier.fillMaxWidth(0.6f),
                     color = MaterialTheme.colorScheme.outlineVariant
                 )
-                
+
                 Spacer(modifier = Modifier.height(20.dp))
-                
+
                 Text(
                     text = "Or get started quickly",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                
+
                 Spacer(modifier = Modifier.height(12.dp))
-                
+
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Try sample content
                     OutlinedButton(
                         onClick = onLoadSamples,
                         shape = RoundedCornerShape(10.dp)
@@ -944,7 +1201,6 @@ fun WelcomeView(
                         Text("Try Sample Content")
                     }
 
-                    // Import existing pack
                     OutlinedButton(
                         onClick = onImport,
                         shape = RoundedCornerShape(10.dp)
@@ -952,20 +1208,18 @@ fun WelcomeView(
                         Text("Import Pack")
                     }
                 }
-                
+
                 Spacer(modifier = Modifier.height(20.dp))
-                
-                // What's a pack? Help text
+
                 Text(
                     text = "Already have a .pack file? Tap 'Import Pack' to load it instantly.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
-                
-                // Server settings (subtle)
+
                 TextButton(onClick = onServerSettings) {
                     Icon(
                         imageVector = Icons.Default.Settings,
@@ -1013,9 +1267,10 @@ private fun HowItWorksStep(number: String, text: String) {
     }
 }
 
-/**
- * Dialog for configuring the processing server URL.
- */
+// =============================================================================
+// DIALOGS (unchanged from original)
+// =============================================================================
+
 @Composable
 fun ServerSettingsDialog(
     currentUrl: String,
@@ -1025,7 +1280,7 @@ fun ServerSettingsDialog(
     onDismiss: () -> Unit
 ) {
     var urlText by remember { mutableStateOf(currentUrl) }
-    
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Processing Server") },
@@ -1036,9 +1291,9 @@ fun ServerSettingsDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                
+
                 Spacer(modifier = Modifier.height(16.dp))
-                
+
                 OutlinedTextField(
                     value = urlText,
                     onValueChange = { urlText = it },
@@ -1047,10 +1302,9 @@ fun ServerSettingsDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                
+
                 Spacer(modifier = Modifier.height(12.dp))
-                
-                // Server status
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
@@ -1094,9 +1348,9 @@ fun ServerSettingsDialog(
                             )
                         }
                     }
-                    
+
                     Spacer(modifier = Modifier.weight(1f))
-                    
+
                     TextButton(onClick = {
                         onUrlChange(urlText)
                         onCheckServer()
@@ -1122,9 +1376,6 @@ fun ServerSettingsDialog(
     )
 }
 
-/**
- * Dialog showing upload/vectorization progress.
- */
 @Composable
 fun UploadProgressDialog(
     progress: UploadProgress,
@@ -1142,23 +1393,23 @@ fun UploadProgressDialog(
                     progress = { progress.progress },
                     modifier = Modifier.size(64.dp),
                 )
-                
+
                 Spacer(modifier = Modifier.height(16.dp))
-                
+
                 Text(
                     text = progress.status,
                     style = MaterialTheme.typography.bodyMedium
                 )
-                
+
                 Spacer(modifier = Modifier.height(8.dp))
-                
+
                 LinearProgressIndicator(
                     progress = { progress.progress },
                     modifier = Modifier.fillMaxWidth(),
                 )
-                
+
                 Spacer(modifier = Modifier.height(4.dp))
-                
+
                 Text(
                     text = "${(progress.progress * 100).toInt()}%",
                     style = MaterialTheme.typography.bodySmall,
