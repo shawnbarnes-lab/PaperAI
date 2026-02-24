@@ -58,10 +58,41 @@
         }
       ],
       "relations": []
+    },
+    {
+      "id": "2:1500292517104147746",
+      "lastPropertyId": "4:2052700944392035908",
+      "name": "DocumentPage",
+      "properties": [
+        {
+          "id": "1:3778557777691007985",
+          "name": "id",
+          "type": 6,
+          "flags": 1
+        },
+        {
+          "id": "2:6400258082942585921",
+          "name": "sourceName",
+          "indexId": "2:5891932103641166771",
+          "type": 9,
+          "flags": 2048
+        },
+        {
+          "id": "3:4666619027448154146",
+          "name": "pageNumber",
+          "type": 5
+        },
+        {
+          "id": "4:2052700944392035908",
+          "name": "text",
+          "type": 9
+        }
+      ],
+      "relations": []
     }
   ],
-  "lastEntityId": "1:778474571083380376",
-  "lastIndexId": "1:1966313500824480303",
+  "lastEntityId": "2:1500292517104147746",
+  "lastIndexId": "2:5891932103641166771",
   "lastRelationId": "0:0",
   "lastSequenceId": "0:0",
   "modelVersion": 5,

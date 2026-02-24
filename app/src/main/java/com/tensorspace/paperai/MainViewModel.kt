@@ -35,20 +35,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _selectedTab = MutableStateFlow(0)
     val selectedTab: StateFlow<Int> = _selectedTab.asStateFlow()
-    
-    // Import result for showing feedback
+
     private val _importResult = MutableStateFlow<VectorImporter.ImportResult?>(null)
     val importResult: StateFlow<VectorImporter.ImportResult?> = _importResult.asStateFlow()
-    
-    // Server URL for vectorizer
+
     private val _serverUrl = MutableStateFlow(prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL)
     val serverUrl: StateFlow<String> = _serverUrl.asStateFlow()
-    
-    // Upload progress
+
     private val _uploadProgress = MutableStateFlow<UploadProgress?>(null)
     val uploadProgress: StateFlow<UploadProgress?> = _uploadProgress.asStateFlow()
-    
-    // Server status
+
     private val _serverStatus = MutableStateFlow<VectorizerClient.ServerStatus?>(null)
     val serverStatus: StateFlow<VectorizerClient.ServerStatus?> = _serverStatus.asStateFlow()
 
@@ -120,26 +116,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * Get full original page text for a document.
+     * Used by the document viewer to reconstruct the complete document
+     * with matched chunks highlighted within the real page text.
+     *
+     * Returns empty list for v1 documents (falls back to chunk-based view).
+     */
+    fun getDocumentPages(sourceName: String): List<DocumentPage> {
+        return ragEngine.getDocumentPages(sourceName)
+    }
+
+    /**
      * Import vectors from a .paperai file URI.
      */
     fun importVectors(uri: android.net.Uri) {
         viewModelScope.launch {
             Log.d(TAG, "Importing vectors from: $uri")
-            
+
             _uiState.value = _uiState.value.copy(isLoading = true)
             _importResult.value = null
-            
+
             try {
                 val result = vectorImporter.importFromUri(uri, ragEngine.getVectorStore())
                 _importResult.value = result
-                
+
                 if (result.success) {
                     val stats = ragEngine.getStats()
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
                         stats = stats
                     )
-                    Log.d(TAG, "Import successful: ${result.chunksImported} chunks from ${result.sourcesImported} sources")
+                    Log.d(TAG, "Import successful: ${result.chunksImported} chunks, ${result.pagesImported} pages from ${result.sourcesImported} sources")
                 } else {
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
@@ -147,7 +154,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     Log.e(TAG, "Import failed: ${result.error}")
                 }
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "Import error", e)
                 _uiState.value = _uiState.value.copy(
@@ -161,49 +168,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    
-    /**
-     * Clear the import result (dismiss the feedback).
-     */
+
     fun clearImportResult() {
         _importResult.value = null
     }
-    
-    /**
-     * Update the vectorizer server URL.
-     */
+
     fun setServerUrl(url: String) {
         _serverUrl.value = url
         prefs.edit().putString(KEY_SERVER_URL, url).apply()
         Log.d(TAG, "Server URL updated: $url")
     }
-    
-    /**
-     * Check if the vectorizer server is online.
-     */
+
     fun checkServer() {
         viewModelScope.launch {
             Log.d(TAG, "Checking server: ${_serverUrl.value}")
             _serverStatus.value = vectorizerClient.checkServer(_serverUrl.value)
         }
     }
-    
-    /**
-     * Upload a document to the server, vectorize it, and auto-import.
-     * This is the main workflow for adding new documents.
-     */
+
     fun uploadAndVectorize(documentUri: android.net.Uri) {
         viewModelScope.launch {
             Log.d(TAG, "Starting upload and vectorize: $documentUri")
-            
+
             _uploadProgress.value = UploadProgress(
                 inProgress = true,
                 progress = 0f,
                 status = "Starting..."
             )
-            
+
             try {
-                // Send to server for vectorization
                 val result = vectorizerClient.vectorizeDocument(
                     serverUrl = _serverUrl.value,
                     documentUri = documentUri,
@@ -215,41 +208,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 )
-                
-                if (result.success && result.vectorJson != null) {
-                    // Auto-import the vectors
-                    _uploadProgress.value = UploadProgress(
-                        inProgress = true,
-                        progress = 0.95f,
-                        status = "Importing vectors..."
-                    )
-                    
+
+                _uploadProgress.value = null
+
+                val vectorJson = result.vectorJson
+
+                if (result.success && vectorJson != null) {
+                    Log.d(TAG, "Vectorization successful, importing...")
+
+                    _uiState.value = _uiState.value.copy(isLoading = true)
+
                     val importResult = vectorImporter.importFromString(
-                        result.vectorJson,
+                        vectorJson,
                         ragEngine.getVectorStore()
                     )
-                    
-                    _uploadProgress.value = null
-                    
+                    _importResult.value = importResult
+
                     if (importResult.success) {
                         val stats = ragEngine.getStats()
-                        _uiState.value = _uiState.value.copy(stats = stats)
-                        _importResult.value = importResult
-                        Log.d(TAG, "Upload and import complete: ${importResult.chunksImported} chunks")
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = false,
+                            stats = stats
+                        )
+                        Log.d(TAG, "Auto-import successful: ${importResult.chunksImported} chunks, ${importResult.pagesImported} pages")
                     } else {
-                        _importResult.value = importResult
-                        Log.e(TAG, "Import failed: ${importResult.error}")
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = false,
+                            error = importResult.error
+                        )
                     }
-                    
                 } else {
-                    _uploadProgress.value = null
                     _importResult.value = VectorImporter.ImportResult(
                         success = false,
                         error = result.error ?: "Vectorization failed"
                     )
                     Log.e(TAG, "Vectorization failed: ${result.error}")
                 }
-                
+
             } catch (e: Exception) {
                 Log.e(TAG, "Upload error", e)
                 _uploadProgress.value = null
@@ -260,10 +255,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
-    
-    /**
-     * Cancel ongoing upload (clears progress state).
-     */
+
     fun cancelUpload() {
         _uploadProgress.value = null
     }
@@ -354,10 +346,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Create sample documents for testing the RAG pipeline.
-     * Now generates REAL embeddings using the ONNX model.
-     */
     private suspend fun createSampleDocuments(): List<DocumentChunk> {
         val chunks = mutableListOf<DocumentChunk>()
 
@@ -404,11 +392,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         )
 
-        // Create chunks with REAL embeddings from the ONNX model
         for ((text, page, source) in survivalContent) {
             Log.d(TAG, "Generating embedding for: $source page $page")
 
-            // Generate REAL embedding using the ONNX model
             val embeddingArray = ragEngine.generateEmbedding(text)
 
             chunks.add(
@@ -457,9 +443,6 @@ data class UiState(
     }
 }
 
-/**
- * Progress state for document upload/vectorization.
- */
 data class UploadProgress(
     val inProgress: Boolean = false,
     val progress: Float = 0f,
