@@ -8,12 +8,12 @@ import kotlinx.coroutines.withContext
 /**
  * RagEngine orchestrates the RAG pipeline.
  *
- * CHANGES FROM ORIGINAL:
- * - Hybrid response: brief LLM summary + source passages (not just LLM or just chunks)
+ * v2.1 CHANGES:
+ * - Uses searchDiversified() instead of search() — max 2 results per source document
+ * - Hybrid response: brief LLM summary + source passages
  * - getContextWindow() returns ±N neighboring chunks around a match
- * - getDocumentChunksOrdered() returns chunks sorted by chunkIndex
- * - Similarity threshold raised to 0.35 (was 0.3) to reduce noise
  * - getDocumentPages() returns full original page text for document reconstruction
+ * - Similarity threshold at 0.35 to reduce noise
  */
 class RagEngine(private val context: Context) {
 
@@ -22,6 +22,7 @@ class RagEngine(private val context: Context) {
         private const val DEFAULT_TOP_K = 5
         private const val MIN_SIMILARITY_THRESHOLD = 0.35f
         private const val CONTEXT_WINDOW_SIZE = 2
+        private const val MAX_RESULTS_PER_SOURCE = 2  // Source diversity cap
     }
 
     private val embeddingService = EmbeddingService(context)
@@ -31,9 +32,6 @@ class RagEngine(private val context: Context) {
     private var isEmbeddingReady = false
     private var isLlmReady = false
 
-    /**
-     * Initialize all RAG components.
-     */
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         Log.d(TAG, "Initializing RAG engine...")
 
@@ -62,7 +60,7 @@ class RagEngine(private val context: Context) {
     }
 
     /**
-     * Perform a RAG query.
+     * Perform a RAG query with source-diversified search.
      */
     suspend fun query(queryText: String, topK: Int = DEFAULT_TOP_K): RagResponse =
         withContext(Dispatchers.IO) {
@@ -85,10 +83,17 @@ class RagEngine(private val context: Context) {
                 Log.d(TAG, "Generating embedding for: '$queryText'")
                 val queryEmbedding = embeddingService.generateEmbedding(queryText)
 
-                Log.d(TAG, "Searching for top $topK chunks")
-                val searchResults = vectorStore.search(queryEmbedding, topK)
+                // KEY CHANGE: Use diversified search instead of raw search.
+                // This fetches 4x candidates then caps at MAX_RESULTS_PER_SOURCE per document,
+                // so a 259-chunk survival manual can't dominate all 5 result slots.
+                Log.d(TAG, "Searching for top $topK chunks (max $MAX_RESULTS_PER_SOURCE per source)")
+                val searchResults = vectorStore.searchDiversified(
+                    queryEmbedding = queryEmbedding,
+                    topK = topK,
+                    maxPerSource = MAX_RESULTS_PER_SOURCE
+                )
                 val relevantChunks = searchResults.filter { it.similarity >= MIN_SIMILARITY_THRESHOLD }
-                Log.d(TAG, "Found ${relevantChunks.size} relevant chunks (filtered from ${searchResults.size})")
+                Log.d(TAG, "Found ${relevantChunks.size} relevant chunks (diversified from ${searchResults.size})")
 
                 if (relevantChunks.isEmpty()) {
                     val processingTime = System.currentTimeMillis() - startTime
@@ -146,9 +151,6 @@ class RagEngine(private val context: Context) {
             }
         }
 
-    /**
-     * Get a context window of ±windowSize chunks around the given chunk.
-     */
     fun getContextWindow(chunk: DocumentChunk, windowSize: Int = CONTEXT_WINDOW_SIZE): List<DocumentChunk> {
         val allChunks = vectorStore.getChunksBySource(chunk.sourceName)
         if (allChunks.isEmpty()) return listOf(chunk)
@@ -221,22 +223,11 @@ ${if (chunks.size > 1) "(${chunks.size - 1} more matching sections found — see
         count
     }
 
-    /**
-     * Get all chunks belonging to a specific document, ordered sequentially.
-     */
     fun getDocumentChunks(sourceName: String): List<DocumentChunk> {
         return vectorStore.getChunksBySource(sourceName)
             .sortedBy { it.chunkIndex.takeIf { idx -> idx > 0 } ?: it.pageNumber }
     }
 
-    /**
-     * Get full original page text for a document.
-     * Used by the document viewer to reconstruct the complete document
-     * and highlight matched chunks within it.
-     *
-     * Returns pages sorted by page number.
-     * Returns empty list for v1 documents that don't have page data.
-     */
     fun getDocumentPages(sourceName: String): List<DocumentPage> {
         val pageBox = ObjectBox.store.boxFor(DocumentPage::class.java)
         return pageBox.query(
@@ -273,9 +264,6 @@ ${if (chunks.size > 1) "(${chunks.size - 1} more matching sections found — see
     }
 }
 
-/**
- * Response from a RAG query.
- */
 data class RagResponse(
     val query: String,
     val answer: String,
@@ -288,9 +276,6 @@ data class RagResponse(
     val response: String get() = answer
 }
 
-/**
- * Stats about the RAG engine state.
- */
 data class RagStats(
     val documentCount: Int,
     val isEmbeddingReady: Boolean,

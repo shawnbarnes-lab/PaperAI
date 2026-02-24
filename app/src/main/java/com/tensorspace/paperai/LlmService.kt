@@ -11,47 +11,35 @@ import java.io.FileOutputStream
 /**
  * LlmService handles on-device LLM inference using MediaPipe's LLM Inference API.
  *
- * CHANGES FROM ORIGINAL:
- * - Temperature lowered to 0.3 for factual RAG (was 0.7 — way too creative)
- * - TOP_K reduced to 20, TOP_P to 0.85 for tighter generation
- * - Added ModelTier enum to support multiple model sizes
- * - Added generateBrief() for short 1-2 sentence summaries (primary RAG mode)
- * - Completely rewritten buildRagPrompt() optimized for small models
- * - Added buildBriefPrompt() for summary-only generation
- * - Added forced response prefix to steer generation
- * - Hard-capped context per chunk to prevent token overflow
- * - Added RepetitionPenalty constant to reduce model loops
+ * v2.1 PROMPT OVERHAUL:
+ * - Temperature 0.3 → 0.1 (near-greedy for factual RAG on a 1B model)
+ * - TOP_K 20 → 10 (tighter sampling = less hallucination)
+ * - Source names now included in prompt so model can reference them
+ * - Forced response prefix on ALL prompts (not just full)
+ * - Brief prompt is primary path — asks for direct answer, not "read then answer"
+ * - Extractive fallback searches ALL chunks, not just the first one
+ * - Better garbage detection: catches repetition loops + off-topic rambling
  */
 class LlmService(private val context: Context) {
 
     companion object {
         private const val TAG = "LlmService"
         private const val MAX_TOKENS = 1024
-        // ---- KEY CHANGES: Generation parameters tuned for factual RAG ----
-        private const val TEMPERATURE = 0.3f       // Was 0.7 — lower = more factual, less hallucination
-        private const val TOP_K = 20               // Was 40 — narrower sampling for precision
-        private const val TOP_P = 0.85f            // Was 0.95 — tighter nucleus sampling
-        private const val MAX_CONTEXT_CHARS = 1500  // Hard cap on total context fed to model
-        private const val MAX_CHUNK_CHARS = 400     // Hard cap per individual chunk
+        // Near-greedy decoding for factual RAG — 1B models hallucinate badly with any creativity
+        private const val TEMPERATURE = 0.1f
+        private const val TOP_K = 10
+        private const val TOP_P = 0.8f
+        private const val MAX_CONTEXT_CHARS = 1500
+        private const val MAX_CHUNK_CHARS = 400
     }
 
-    /**
-     * Model tiers — detect what the device can handle and pick the best option.
-     * Higher tier = better answers but slower inference and more RAM.
-     *
-     * To use a bigger model:
-     *   1. Place the .task file in assets/models/
-     *   2. Update the enum entry's assetPath and fileName
-     *   3. The service auto-selects the best available model at init time
-     */
     enum class ModelTier(
         val displayName: String,
         val assetPath: String,
         val fileName: String,
         val minRamMb: Long,
-        val priority: Int  // higher = preferred when device supports it
+        val priority: Int
     ) {
-        // Current model — works on most devices
         GEMMA_1B(
             displayName = "Gemma 3 1B (int4)",
             assetPath = "models/gemma3.task",
@@ -59,22 +47,13 @@ class LlmService(private val context: Context) {
             minRamMb = 2048,
             priority = 1
         ),
-        // Upgrade path — significantly better quality, needs ~4GB free RAM
-        // To enable: add the .task file to assets/models/ and uncomment
-        // GEMMA_2B(
-        //     displayName = "Gemma 2 2B (int4)",
-        //     assetPath = "models/gemma2-2b.task",
-        //     fileName = "gemma2-2b.task",
-        //     minRamMb = 4096,
+        // Future: uncomment when bundling a bigger model
+        // GEMMA_3N_E2B(
+        //     displayName = "Gemma 3n E2B",
+        //     assetPath = "models/gemma3n-e2b.litertlm",
+        //     fileName = "gemma3n-e2b.litertlm",
+        //     minRamMb = 3072,
         //     priority = 2
-        // ),
-        // Big upgrade — needs ~6GB free RAM, flagship devices only
-        // PHI3_MINI(
-        //     displayName = "Phi-3 Mini 3.8B (int4)",
-        //     assetPath = "models/phi3-mini.task",
-        //     fileName = "phi3-mini.task",
-        //     minRamMb = 6144,
-        //     priority = 3
         // ),
     }
 
@@ -83,10 +62,6 @@ class LlmService(private val context: Context) {
     private var modelPath: String? = null
     private var activeModel: ModelTier? = null
 
-    /**
-     * Initialize the LLM service.
-     * Selects the best model the device can support, copies from assets, and loads it.
-     */
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) {
             Log.d(TAG, "LLM already initialized")
@@ -96,7 +71,6 @@ class LlmService(private val context: Context) {
         try {
             Log.d(TAG, "Starting LLM initialization...")
 
-            // Select best model for this device
             val selectedModel = selectBestModel()
             if (selectedModel == null) {
                 Log.e(TAG, "No compatible model found for this device")
@@ -105,7 +79,6 @@ class LlmService(private val context: Context) {
             activeModel = selectedModel
             Log.d(TAG, "Selected model: ${selectedModel.displayName}")
 
-            // Copy model from assets to internal storage (if needed)
             val modelFile = copyModelFromAssets(selectedModel)
             if (modelFile == null) {
                 Log.e(TAG, "Failed to copy model from assets")
@@ -114,14 +87,12 @@ class LlmService(private val context: Context) {
             modelPath = modelFile.absolutePath
             Log.d(TAG, "Model file ready at: $modelPath")
 
-            // Create LLM Inference options
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(modelPath!!)
                 .setMaxTokens(MAX_TOKENS)
                 .setPreferredBackend(LlmInference.Backend.CPU)
                 .build()
 
-            // Load the model
             Log.d(TAG, "Loading LLM model (this may take 10-30 seconds)...")
             llmInference = LlmInference.createFromOptions(context, options)
 
@@ -136,10 +107,6 @@ class LlmService(private val context: Context) {
         }
     }
 
-    /**
-     * Select the highest-priority model that the device can run.
-     * Checks available RAM and whether the model asset exists.
-     */
     private fun selectBestModel(): ModelTier? {
         val runtime = Runtime.getRuntime()
         val availableRamMb = runtime.maxMemory() / (1024 * 1024)
@@ -147,7 +114,6 @@ class LlmService(private val context: Context) {
 
         return ModelTier.values()
             .filter { tier ->
-                // Check if model asset exists
                 val assetExists = try {
                     context.assets.open(tier.assetPath).close()
                     true
@@ -159,14 +125,10 @@ class LlmService(private val context: Context) {
             .maxByOrNull { it.priority }
     }
 
-    /**
-     * Copy the model file from assets to internal storage.
-     */
     private fun copyModelFromAssets(model: ModelTier): File? {
         try {
             val modelFile = File(context.filesDir, model.fileName)
 
-            // Check if already copied
             if (modelFile.exists()) {
                 Log.d(TAG, "Model already exists at ${modelFile.absolutePath} (${modelFile.length() / 1024 / 1024} MB)")
                 return modelFile
@@ -203,8 +165,7 @@ class LlmService(private val context: Context) {
     }
 
     /**
-     * Generate a FULL response based on the query and retrieved context chunks.
-     * Used when the user wants a detailed AI-generated answer.
+     * Generate a FULL response. Used for detailed answers.
      */
     suspend fun generate(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -235,11 +196,11 @@ class LlmService(private val context: Context) {
         }
 
     /**
-     * Generate a BRIEF 1-2 sentence summary from the retrieved context.
+     * Generate a BRIEF 1-2 sentence summary — the primary RAG mode.
      *
-     * This is the primary RAG mode. Small models (1-2B params) produce much better
-     * results when asked for a short factual summary vs. a long synthesized answer.
-     * The UI then displays this summary + the actual source passages below it.
+     * A 1B model produces much better results when asked for a short direct
+     * answer vs. a long synthesized essay. The UI shows this summary + the
+     * actual source passages below it.
      */
     suspend fun generateBrief(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -259,16 +220,25 @@ class LlmService(private val context: Context) {
                 val response = llmInference!!.generateResponse(prompt)
                 val elapsed = System.currentTimeMillis() - startTime
 
-                Log.d(TAG, "Brief response in ${elapsed}ms")
+                Log.d(TAG, "Brief response in ${elapsed}ms: '${response.take(100)}'")
 
                 val cleaned = cleanResponse(response)
 
-                // If the model produced garbage or too much, fall back to extractive
-                if (cleaned.length < 10 || cleaned.length > 500) {
-                    Log.w(TAG, "Brief response was ${cleaned.length} chars, falling back to extractive")
-                    buildExtractiveAnswer(query, contextChunks)
-                } else {
-                    cleaned
+                // Detect garbage: too short, too long, or repetition loops
+                when {
+                    cleaned.length < 10 -> {
+                        Log.w(TAG, "Brief response too short (${cleaned.length} chars), extractive fallback")
+                        buildExtractiveAnswer(query, contextChunks)
+                    }
+                    cleaned.length > 500 -> {
+                        Log.w(TAG, "Brief response too long (${cleaned.length} chars), extractive fallback")
+                        buildExtractiveAnswer(query, contextChunks)
+                    }
+                    hasRepetitionLoop(cleaned) -> {
+                        Log.w(TAG, "Brief response has repetition loop, extractive fallback")
+                        buildExtractiveAnswer(query, contextChunks)
+                    }
+                    else -> cleaned
                 }
 
             } catch (e: Exception) {
@@ -278,7 +248,7 @@ class LlmService(private val context: Context) {
         }
 
     /**
-     * Generate a response with streaming (token by token).
+     * Streaming generation (token by token for UI feedback).
      */
     suspend fun generateStreaming(
         query: String,
@@ -304,7 +274,6 @@ class LlmService(private val context: Context) {
             val response = llmInference!!.generateResponse(prompt)
             val cleanedResponse = cleanResponse(response)
 
-            // Stream word by word for UI feedback
             val words = cleanedResponse.split(" ")
             val result = StringBuilder()
 
@@ -332,19 +301,19 @@ class LlmService(private val context: Context) {
     /**
      * Build the full RAG prompt.
      *
-     * Key differences from original:
-     * - Hard cap each chunk at MAX_CHUNK_CHARS (prevents token overflow)
-     * - Removed meta-instructions like "reference which source" (wastes tokens on small models)
-     * - Added forced response prefix "Based on the sources:" to steer generation
-     * - Simpler, more direct instructions — small models follow simple prompts better
+     * Key design for 1B models:
+     * - Source names labeled so model can reference them
+     * - Minimal instructions — every extra word degrades quality
+     * - Forced response prefix steers generation immediately
+     * - Hard caps prevent token overflow
      */
     private fun buildRagPrompt(query: String, contextChunks: List<DocumentChunk>): String {
         val contextText = contextChunks.take(3).mapIndexed { index, chunk ->
+            val label = chunk.sourceName.take(40)
             val truncatedText = chunk.text.take(MAX_CHUNK_CHARS)
-            "[${index + 1}] $truncatedText"
+            "[Source: $label]\n$truncatedText"
         }.joinToString("\n---\n")
 
-        // Hard cap total context
         val finalContext = if (contextText.length > MAX_CONTEXT_CHARS) {
             contextText.take(MAX_CONTEXT_CHARS)
         } else {
@@ -352,60 +321,116 @@ class LlmService(private val context: Context) {
         }
 
         return """<start_of_turn>user
-Answer using ONLY these sources. If the answer isn't in the sources, say "Not found in documents."
+Answer ONLY from these sources. Be brief and factual.
 
-Sources:
 $finalContext
 
 Question: $query
 <end_of_turn>
 <start_of_turn>model
-Based on the sources: """
+Answer: """
     }
 
     /**
-     * Build a prompt for brief (1-2 sentence) summary generation.
-     * Even more constrained than the full prompt — forces a short output.
+     * Build the brief prompt — primary RAG mode.
+     *
+     * For 1B models, the key tricks:
+     * 1. Put the question FIRST so the model sees it before the context
+     *    (attention is strongest at start and end of context)
+     * 2. Include source names so the answer can reference them
+     * 3. Forced prefix "Based on [source]," steers the model to cite
+     * 4. Absolute minimum instructions — no "read the sources then..."
      */
     private fun buildBriefPrompt(query: String, contextChunks: List<DocumentChunk>): String {
-        // For brief mode, use only top 2 chunks with aggressive truncation
+        // Take top 2 chunks with source labels
         val contextText = contextChunks.take(2).mapIndexed { index, chunk ->
-            "[${index + 1}] ${chunk.text.take(300)}"
+            val label = chunk.sourceName.take(40)
+            "[${label}] ${chunk.text.take(300)}"
         }.joinToString("\n---\n")
 
+        // Build a smart prefix using the top source name
+        val topSource = contextChunks.first().sourceName
+            .replace(".pdf", "")
+            .replace("_", " ")
+            .take(30)
+
         return """<start_of_turn>user
-Read the sources, then answer in ONE or TWO sentences only.
+Question: $query
 
 Sources:
 $contextText
 
-Question: $query
+Answer in 1-2 sentences only.
 <end_of_turn>
 <start_of_turn>model
-"""
+Based on $topSource, """
     }
 
     /**
      * Pure extractive fallback — no LLM needed.
-     * Picks the most relevant sentence from the top chunk that relates to the query.
-     * Used when LLM fails, produces garbage, or isn't loaded yet.
+     *
+     * IMPROVED: Now searches ALL chunks (not just first) for the best
+     * matching sentence. With diversified search results, we might have
+     * chunks from 3 different documents — the best sentence could be
+     * in any of them.
      */
     private fun buildExtractiveAnswer(query: String, contextChunks: List<DocumentChunk>): String {
         if (contextChunks.isEmpty()) return "No relevant information found."
 
-        val topChunk = contextChunks.first()
-        val sentences = topChunk.text
-            .split(Regex("[.!?]+\\s+"))
-            .filter { it.length > 20 }
-
-        // Simple keyword overlap scoring to pick the best sentence
         val queryWords = query.lowercase().split(Regex("\\s+")).toSet()
-        val bestSentence = sentences.maxByOrNull { sentence ->
-            val sentenceWords = sentence.lowercase().split(Regex("\\s+")).toSet()
-            queryWords.intersect(sentenceWords).size
-        } ?: sentences.firstOrNull() ?: topChunk.text.take(200)
 
-        return "${bestSentence.trim()}."
+        // Search ALL chunks for the best matching sentence, not just the first
+        var bestSentence: String? = null
+        var bestScore = -1
+        var bestSource: String? = null
+
+        for (chunk in contextChunks.take(5)) {
+            val sentences = chunk.text
+                .split(Regex("[.!?]+\\s+"))
+                .filter { it.length > 20 }
+
+            for (sentence in sentences) {
+                val sentenceWords = sentence.lowercase().split(Regex("\\s+")).toSet()
+                val score = queryWords.intersect(sentenceWords).size
+                if (score > bestScore) {
+                    bestScore = score
+                    bestSentence = sentence.trim()
+                    bestSource = chunk.sourceName
+                        .replace(".pdf", "")
+                        .replace("_", " ")
+                }
+            }
+        }
+
+        return if (bestSentence != null && bestSource != null) {
+            "From $bestSource: $bestSentence."
+        } else {
+            // Last resort: just show beginning of top chunk
+            val topChunk = contextChunks.first()
+            topChunk.text.take(200).trim() + "..."
+        }
+    }
+
+    /**
+     * Detect repetition loops — a common failure mode for small models.
+     * If any 8+ word phrase repeats 3+ times, it's a loop.
+     */
+    private fun hasRepetitionLoop(text: String): Boolean {
+        val words = text.split(Regex("\\s+"))
+        if (words.size < 24) return false
+
+        // Check for repeated 8-word sequences
+        val windowSize = 8
+        val sequences = mutableMapOf<String, Int>()
+
+        for (i in 0..words.size - windowSize) {
+            val seq = words.subList(i, i + windowSize).joinToString(" ").lowercase()
+            val count = (sequences[seq] ?: 0) + 1
+            sequences[seq] = count
+            if (count >= 3) return true
+        }
+
+        return false
     }
 
     /**
@@ -417,18 +442,13 @@ Question: $query
             .replace("<eos>", "")
             .replace("<start_of_turn>", "")
             .replace("model\n", "")
-            .replace(Regex("^\\s*Based on the sources:\\s*"), "")  // Remove forced prefix if model echoed it
+            .replace(Regex("^\\s*Answer:\\s*"), "")
+            .replace(Regex("^\\s*Based on the sources:\\s*"), "")
             .trim()
     }
 
-    /**
-     * Check if the LLM is ready to generate responses.
-     */
     fun isReady(): Boolean = isInitialized && llmInference != null
 
-    /**
-     * Get model info for display in the UI.
-     */
     fun getModelInfo(): String {
         return if (isInitialized && activeModel != null) {
             activeModel!!.displayName
@@ -437,9 +457,6 @@ Question: $query
         }
     }
 
-    /**
-     * Release resources when done.
-     */
     fun close() {
         try {
             llmInference?.close()
