@@ -1,91 +1,175 @@
-# PaperAI Vectorizer
+# PaperAI — On-Device RAG for Android
 
-GPU-accelerated document vectorizer for PaperAI. Run the server on your powerful machine, upload documents from the Android app, and get vectors back automatically.
+**Search your documents with AI, entirely on your phone.**
+
+PaperAI is an Android app that uses Retrieval-Augmented Generation (RAG) to let you search personal documents with natural language. Upload PDFs, vectorize them on your GPU server, and query them offline with semantic search and an on-device LLM.
+
+Your data never touches a cloud service. Vectorization runs on your own hardware. Search and AI answers run locally on the phone.
+
+---
+
+## How It Works
+
+```
+ You upload a PDF
+       │
+       ▼
+┌──────────────────────────┐
+│  Vectorizer Server (GPU) │  ← Your machine (RTX 3090/4090)
+│  Flask + sentence-transformers
+│  Splits into semantic chunks
+│  Generates 384-dim embeddings
+│  Returns .paperai file
+└──────────────────────────┘
+       │
+       ▼
+┌──────────────────────────┐
+│  Android App (This Repo) │  ← Runs 100% offline after import
+│  ObjectBox vector DB
+│  On-device query embedding
+│  Diversified similarity search
+│  Gemma 3 1B LLM (on-device)
+│  Shows AI summary + sources
+└──────────────────────────┘
+```
+
+1. Upload PDF/TXT → server chunks it semantically and generates embeddings
+2. Download `.paperai` file (JSON with chunks, embeddings, and full page text)
+3. Import into app → stored in ObjectBox vector database on device
+4. Search with natural language → on-device embedding → vector similarity search
+5. AI generates brief summary from retrieved context → source passages displayed below
+
+---
+
+## Features
+
+- **Semantic search** — finds meaning, not just keywords. "water purification" matches "making contaminated water safe to drink"
+- **Source-diversified results** — large documents can't monopolize search results (max 2 per source)
+- **On-device LLM** — Gemma 3 1B generates brief answers from retrieved context, no internet needed
+- **Full document reconstruction** — tap any source to view the original document with matched sections highlighted
+- **Extractive fallback** — if the LLM fails or isn't loaded, the app still returns the best matching sentence across all results
+- **Privacy first** — documents vectorized on your hardware, search runs locally, zero telemetry
+
+---
 
 ## Architecture
 
-```
-[PaperAI App]                    [Your RTX 3090 Server]
-     │                                    │
-     │  1. User picks document            │
-     │  ─────────────────────────────►    │
-     │     (upload .txt/.pdf)             │
-     │                                    │
-     │                           2. Vectorize with GPU
-     │                                    │
-     │  3. Receive .paperai vectors       │
-     │  ◄─────────────────────────────    │
-     │                                    │
-     │  4. Auto-import into app           │
-     ▼                                    │
-  Ready to query!
+### Android App (this repo)
+
+| File | Purpose |
+|------|---------|
+| `RagEngine.kt` | Orchestrates the full RAG pipeline — embedding, search, LLM, response |
+| `VectorStore.kt` | ObjectBox wrapper with `searchDiversified()` — ANN search with source diversity cap |
+| `LlmService.kt` | On-device Gemma 3 1B via MediaPipe LLM Inference API |
+| `EmbeddingService.kt` | On-device query embedding (all-MiniLM-L6-v2 via MediaPipe) |
+| `VectorImporter.kt` | Parses `.paperai` JSON into ObjectBox entities |
+| `DocumentChunk.kt` | ObjectBox entity — text, 384-dim embedding, page number, source metadata |
+| `DocumentPage.kt` | ObjectBox entity — full original page text for document viewer |
+| `VectorizerClient.kt` | HTTP client for upload/vectorize workflow |
+| `MainScreen.kt` | Jetpack Compose UI — search, AI response tab, sources tab |
+| `MainViewModel.kt` | UI state management |
+
+### Vectorizer Server ([separate repo](https://github.com/shawnbarnes-lab/paperai-vectorizer-v2))
+
+| File | Purpose |
+|------|---------|
+| `server.py` | Flask API — accepts documents, returns `.paperai` files |
+| `semantic_chunker.py` | Splits text into semantic chunks with accurate page tracking via character offsets |
+
+### Models
+
+| Model | Size | Where | Purpose |
+|-------|------|-------|---------|
+| all-MiniLM-L6-v2 | ~80MB | Both server + device | Text embeddings (384-dim) |
+| Gemma 3 1B (int4) | ~530MB | Device only | Answer generation |
+
+Both sides use the same embedding model so query vectors match document vectors.
+
+### .paperai File Format (v2.1)
+
+```json
+{
+  "version": 2.1,
+  "chunks": [
+    {
+      "text": "chunk text...",
+      "embedding": [0.012, -0.034, ...],
+      "page": 5,
+      "source": "document.pdf",
+      "chunk_index": 3,
+      "total_chunks": 42,
+      "section_title": "Chapter 2"
+    }
+  ],
+  "pages": [
+    {"page": 1, "text": "full original page text..."},
+    {"page": 2, "text": "..."}
+  ]
+}
 ```
 
-## Server Setup (Ubuntu/RTX 3090)
+---
+
+## Setup
+
+### Requirements
+
+- Android Studio Hedgehog+ with JDK 17
+- Git LFS (`git lfs install`) — required for model files
+- GPU machine for the vectorizer server (see [vectorizer repo](https://github.com/shawnbarnes-lab/paperai-vectorizer-v2))
+
+### Build
 
 ```bash
-# Install dependencies
-pip install flask sentence-transformers PyPDF2 tqdm torch
+git lfs install
+git clone https://github.com/shawnbarnes-lab/PaperAI.git
+cd PaperAI
+# Open in Android Studio → Build → Run
+```
 
-# For CUDA support
-pip install torch --index-url https://download.pytorch.org/whl/cu118
+### Server Setup
 
-# Run the server
+```bash
+git clone https://github.com/shawnbarnes-lab/paperai-vectorizer-v2.git
+cd paperai-vectorizer-v2
+pip install -r requirements.txt
 python server.py
-
-# Or specify host/port
-python server.py --host 0.0.0.0 --port 5000
+# Expose via ngrok: ngrok http 5000
 ```
 
-The server will show your local IP address - use this in the Android app.
+In the app: Settings → Server URL → paste your ngrok URL.
 
-## Android App Setup
+---
 
-1. Open PaperAI
-2. Tap the **Settings** icon (gear) in the top bar
-3. Enter your server URL (e.g., `http://192.168.1.100:5000`)
-4. Tap **Test** to verify connection
+## Device Compatibility
 
-## Usage
+| Tier | Devices | Experience |
+|------|---------|------------|
+| **Full** | Galaxy S22 Ultra+, Pixel 8+ (8GB+ RAM) | LLM loads, AI summaries work |
+| **Search only** | Galaxy Note 10, mid-range (4-6GB RAM) | LLM may not load, extractive fallback works, search is still fast |
+| **Minimum** | Older devices (2-3GB RAM) | Search works, no AI answers |
 
-1. Tap the **+** button in PaperAI
-2. Select a document (.txt or .pdf)
-3. Wait for server to process (you'll see progress)
-4. Document is automatically imported and ready to query!
+The app gracefully degrades — search and source display work on any device, LLM is a bonus on capable hardware.
 
-## Alternative: Offline Vectorization
+---
 
-If you prefer to vectorize manually:
+## Educational Use
 
-```bash
-# Run on your GPU machine
-python vectorizer.py survival_guide.pdf
+Built as a teaching tool for the [Outschool AI Engineering course](https://outschool.com/classes/build-real-ai-on-real-hardware-a-teens-guide-to-generative-ai-11-hOmPLAiZ). Demonstrates RAG architecture, vector embeddings, on-device ML inference, and client-server AI systems.
 
-# Transfer .paperai file to phone
-# In app: tap "Import .paperai" instead of "Upload Document"
-```
+---
 
-## Model Compatibility
+## Related
 
-Uses `sentence-transformers/all-MiniLM-L6-v2` - the same model as the Android app.
-This ensures query embeddings on the phone match document embeddings from the server.
+- **Vectorizer Server:** [github.com/shawnbarnes-lab/paperai-vectorizer-v2](https://github.com/shawnbarnes-lab/paperai-vectorizer-v2)
+- **Tensor Space:** [tensorspace.net](https://tensorspace.net)
 
-## Troubleshooting
+---
 
-**"Cannot connect to server"**
-- Make sure server is running (`python server.py`)
-- Check firewall allows port 5000
-- Verify phone and server are on same network
-- Try the server's local IP (not localhost)
+## License
 
-**"Vectorization failed"**
-- Check server console for error messages
-- Ensure PDF is readable (not scanned image)
-- Try with a .txt file first
+MIT
 
-## Android Permissions
+---
 
-Add to your AndroidManifest.xml:
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-```
+**Shawn Barnes** — Tensor Space LLC — [shawn.barnes@tensorspace.net](mailto:shawn.barnes@tensorspace.net)

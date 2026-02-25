@@ -1,5 +1,6 @@
 package com.tensorspace.paperai
 
+import android.app.ActivityManager
 import android.content.Context
 import android.util.Log
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
@@ -11,56 +12,28 @@ import java.io.FileOutputStream
 /**
  * LlmService handles on-device LLM inference using MediaPipe's LLM Inference API.
  *
- * v2.1 PROMPT OVERHAUL:
- * - Temperature 0.3 → 0.1 (near-greedy for factual RAG on a 1B model)
- * - TOP_K 20 → 10 (tighter sampling = less hallucination)
- * - Source names now included in prompt so model can reference them
- * - Forced response prefix on ALL prompts (not just full)
- * - Brief prompt is primary path — asks for direct answer, not "read then answer"
- * - Extractive fallback searches ALL chunks, not just the first one
- * - Better garbage detection: catches repetition loops + off-topic rambling
+ * v3.0 — Gemma 2B int4
+ * - Upgraded from 1B to 2B for much better instruction following
+ * - Better source citation and paraphrasing
+ * - Can actually refuse when sources don't contain an answer
+ * - Tuned prompts for 2B model's stronger capabilities
  */
 class LlmService(private val context: Context) {
 
     companion object {
         private const val TAG = "LlmService"
         private const val MAX_TOKENS = 1024
-        // Near-greedy decoding for factual RAG — 1B models hallucinate badly with any creativity
-        private const val TEMPERATURE = 0.1f
-        private const val TOP_K = 10
-        private const val TOP_P = 0.8f
-        private const val MAX_CONTEXT_CHARS = 1500
-        private const val MAX_CHUNK_CHARS = 400
-    }
-
-    enum class ModelTier(
-        val displayName: String,
-        val assetPath: String,
-        val fileName: String,
-        val minRamMb: Long,
-        val priority: Int
-    ) {
-        GEMMA_1B(
-            displayName = "Gemma 3 1B (int4)",
-            assetPath = "models/gemma3.task",
-            fileName = "gemma3.task",
-            minRamMb = 2048,
-            priority = 1
-        ),
-        // Future: uncomment when bundling a bigger model
-        // GEMMA_3N_E2B(
-        //     displayName = "Gemma 3n E2B",
-        //     assetPath = "models/gemma3n-e2b.litertlm",
-        //     fileName = "gemma3n-e2b.litertlm",
-        //     minRamMb = 3072,
-        //     priority = 2
-        // ),
+        private const val MAX_CONTEXT_CHARS = 2000
+        private const val MAX_CHUNK_CHARS = 500
+        private const val MODEL_ASSET_PATH = "models/gemma-2b-int4.task"
+        private const val MODEL_FILE_NAME = "gemma-2b-int4.task"
+        private const val MODEL_DISPLAY_NAME = "Gemma 2B (int4)"
+        private const val MIN_RAM_MB = 4096L
     }
 
     private var llmInference: LlmInference? = null
     private var isInitialized = false
     private var modelPath: String? = null
-    private var activeModel: ModelTier? = null
 
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) {
@@ -71,21 +44,23 @@ class LlmService(private val context: Context) {
         try {
             Log.d(TAG, "Starting LLM initialization...")
 
-            val selectedModel = selectBestModel()
-            if (selectedModel == null) {
-                Log.e(TAG, "No compatible model found for this device")
+            if (!hasEnoughRam()) {
+                Log.e(TAG, "Device does not have enough RAM for $MODEL_DISPLAY_NAME")
                 return@withContext false
             }
-            activeModel = selectedModel
-            Log.d(TAG, "Selected model: ${selectedModel.displayName}")
 
-            val modelFile = copyModelFromAssets(selectedModel)
+            if (!isModelAvailable()) {
+                Log.e(TAG, "Model asset not found: $MODEL_ASSET_PATH")
+                return@withContext false
+            }
+
+            val modelFile = copyModelFromAssets()
             if (modelFile == null) {
                 Log.e(TAG, "Failed to copy model from assets")
                 return@withContext false
             }
             modelPath = modelFile.absolutePath
-            Log.d(TAG, "Model file ready at: $modelPath")
+            Log.d(TAG, "Model file ready at: $modelPath (${modelFile.length() / 1024 / 1024} MB)")
 
             val options = LlmInference.LlmInferenceOptions.builder()
                 .setModelPath(modelPath!!)
@@ -97,7 +72,7 @@ class LlmService(private val context: Context) {
             llmInference = LlmInference.createFromOptions(context, options)
 
             isInitialized = true
-            Log.d(TAG, "LLM initialized successfully with ${selectedModel.displayName}")
+            Log.d(TAG, "LLM initialized successfully with $MODEL_DISPLAY_NAME")
             true
 
         } catch (e: Exception) {
@@ -107,37 +82,53 @@ class LlmService(private val context: Context) {
         }
     }
 
-    private fun selectBestModel(): ModelTier? {
-        val runtime = Runtime.getRuntime()
-        val availableRamMb = runtime.maxMemory() / (1024 * 1024)
-        Log.d(TAG, "Available RAM: ${availableRamMb}MB")
+    /**
+     * Check if device has enough RAM.
+     */
+    private fun hasEnoughRam(): Boolean {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memInfo = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
 
-        return ModelTier.values()
-            .filter { tier ->
-                val assetExists = try {
-                    context.assets.open(tier.assetPath).close()
-                    true
-                } catch (e: Exception) {
-                    false
-                }
-                assetExists && availableRamMb >= tier.minRamMb
-            }
-            .maxByOrNull { it.priority }
+        val totalRamMb = memInfo.totalMem / (1024 * 1024)
+        val availableRamMb = memInfo.availMem / (1024 * 1024)
+        Log.d(TAG, "Device RAM: ${totalRamMb}MB total, ${availableRamMb}MB available (need ${MIN_RAM_MB}MB)")
+
+        return totalRamMb >= MIN_RAM_MB
     }
 
-    private fun copyModelFromAssets(model: ModelTier): File? {
+    /**
+     * Check if the model asset exists.
+     */
+    private fun isModelAvailable(): Boolean {
+        val localExists = File(context.filesDir, MODEL_FILE_NAME).exists()
+        val assetExists = try {
+            context.assets.open(MODEL_ASSET_PATH).close()
+            true
+        } catch (e: Exception) {
+            false
+        }
+
+        Log.d(TAG, "Model $MODEL_DISPLAY_NAME: asset=$assetExists, local=$localExists")
+        return assetExists || localExists
+    }
+
+    /**
+     * Copy model from assets to internal storage.
+     */
+    private fun copyModelFromAssets(): File? {
         try {
-            val modelFile = File(context.filesDir, model.fileName)
+            val modelFile = File(context.filesDir, MODEL_FILE_NAME)
 
             if (modelFile.exists()) {
                 Log.d(TAG, "Model already exists at ${modelFile.absolutePath} (${modelFile.length() / 1024 / 1024} MB)")
                 return modelFile
             }
 
-            Log.d(TAG, "Copying model from assets (this may take a minute)...")
+            Log.d(TAG, "Copying $MODEL_DISPLAY_NAME from assets (this may take a minute)...")
             val startTime = System.currentTimeMillis()
 
-            context.assets.open(model.assetPath).use { inputStream ->
+            context.assets.open(MODEL_ASSET_PATH).use { inputStream ->
                 FileOutputStream(modelFile).use { outputStream ->
                     val buffer = ByteArray(8192)
                     var bytesRead: Int
@@ -165,7 +156,7 @@ class LlmService(private val context: Context) {
     }
 
     /**
-     * Generate a FULL response. Used for detailed answers.
+     * Generate a FULL response.
      */
     suspend fun generate(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -196,11 +187,7 @@ class LlmService(private val context: Context) {
         }
 
     /**
-     * Generate a BRIEF 1-2 sentence summary — the primary RAG mode.
-     *
-     * A 1B model produces much better results when asked for a short direct
-     * answer vs. a long synthesized essay. The UI shows this summary + the
-     * actual source passages below it.
+     * Generate a BRIEF 2-3 sentence summary — the primary RAG mode.
      */
     suspend fun generateBrief(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -220,17 +207,16 @@ class LlmService(private val context: Context) {
                 val response = llmInference!!.generateResponse(prompt)
                 val elapsed = System.currentTimeMillis() - startTime
 
-                Log.d(TAG, "Brief response in ${elapsed}ms: '${response.take(100)}'")
+                Log.d(TAG, "Brief response in ${elapsed}ms: '${response.take(120)}'")
 
                 val cleaned = cleanResponse(response)
 
-                // Detect garbage: too short, too long, or repetition loops
                 when {
-                    cleaned.length < 10 -> {
+                    cleaned.length < 5 -> {
                         Log.w(TAG, "Brief response too short (${cleaned.length} chars), extractive fallback")
                         buildExtractiveAnswer(query, contextChunks)
                     }
-                    cleaned.length > 500 -> {
+                    cleaned.length > 800 -> {
                         Log.w(TAG, "Brief response too long (${cleaned.length} chars), extractive fallback")
                         buildExtractiveAnswer(query, contextChunks)
                     }
@@ -248,7 +234,7 @@ class LlmService(private val context: Context) {
         }
 
     /**
-     * Streaming generation (token by token for UI feedback).
+     * Streaming generation.
      */
     suspend fun generateStreaming(
         query: String,
@@ -295,23 +281,18 @@ class LlmService(private val context: Context) {
     }
 
     // ============================================================================
-    // PROMPT ENGINEERING — The biggest lever for small model quality
+    // PROMPT ENGINEERING — Tuned for Gemma 2B
     // ============================================================================
 
     /**
-     * Build the full RAG prompt.
-     *
-     * Key design for 1B models:
-     * - Source names labeled so model can reference them
-     * - Minimal instructions — every extra word degrades quality
-     * - Forced response prefix steers generation immediately
-     * - Hard caps prevent token overflow
+     * Full RAG prompt — 2B can handle complex instructions reliably.
      */
     private fun buildRagPrompt(query: String, contextChunks: List<DocumentChunk>): String {
-        val contextText = contextChunks.take(3).mapIndexed { index, chunk ->
-            val label = chunk.sourceName.take(40)
+        val contextText = contextChunks.take(4).mapIndexed { index, chunk ->
+            val label = chunk.sourceName.take(50)
+            val section = if (chunk.sectionTitle.isNotBlank()) " — ${chunk.sectionTitle}" else ""
             val truncatedText = chunk.text.take(MAX_CHUNK_CHARS)
-            "[Source: $label]\n$truncatedText"
+            "[Source ${index + 1}: $label$section, Page ${chunk.pageNumber}]\n$truncatedText"
         }.joinToString("\n---\n")
 
         val finalContext = if (contextText.length > MAX_CONTEXT_CHARS) {
@@ -321,65 +302,59 @@ class LlmService(private val context: Context) {
         }
 
         return """<start_of_turn>user
-Answer ONLY from these sources. Be brief and factual.
+You are a document research assistant. Your job is to answer questions using ONLY the provided source documents. Follow these rules strictly:
 
+1. ONLY use information found in the sources below. Never use outside knowledge.
+2. If the sources do not contain enough information to answer, say: "The loaded documents do not contain information about this topic."
+3. Mention which source the information comes from.
+4. Be concise and factual. No speculation or assumptions.
+5. If multiple sources are relevant, synthesize information from all of them.
+
+SOURCES:
 $finalContext
 
-Question: $query
+QUESTION: $query
 <end_of_turn>
 <start_of_turn>model
-Answer: """
+"""
     }
 
     /**
-     * Build the brief prompt — primary RAG mode.
-     *
-     * For 1B models, the key tricks:
-     * 1. Put the question FIRST so the model sees it before the context
-     *    (attention is strongest at start and end of context)
-     * 2. Include source names so the answer can reference them
-     * 3. Forced prefix "Based on [source]," steers the model to cite
-     * 4. Absolute minimum instructions — no "read the sources then..."
+     * Brief prompt — 2-3 sentence answer with source citation.
      */
     private fun buildBriefPrompt(query: String, contextChunks: List<DocumentChunk>): String {
-        // Take top 2 chunks with source labels
-        val contextText = contextChunks.take(2).mapIndexed { index, chunk ->
-            val label = chunk.sourceName.take(40)
-            "[${label}] ${chunk.text.take(300)}"
+        val contextText = contextChunks.take(3).mapIndexed { index, chunk ->
+            val label = chunk.sourceName.take(50)
+            val section = if (chunk.sectionTitle.isNotBlank()) " — ${chunk.sectionTitle}" else ""
+            "[${label}${section}, p.${chunk.pageNumber}] ${chunk.text.take(400)}"
         }.joinToString("\n---\n")
 
-        // Build a smart prefix using the top source name
-        val topSource = contextChunks.first().sourceName
-            .replace(".pdf", "")
-            .replace("_", " ")
-            .take(30)
-
         return """<start_of_turn>user
-Question: $query
+You are a document research assistant. Answer the question using ONLY the sources below.
+
+Rules:
+- Use ONLY facts from the sources. Do not add outside knowledge.
+- If the answer is not in the sources, say "This is not covered in the loaded documents."
+- Mention the source name in your answer.
+- Keep your answer to 2-3 sentences maximum.
 
 Sources:
 $contextText
 
-Answer in 1-2 sentences only.
+Question: $query
 <end_of_turn>
 <start_of_turn>model
-Based on $topSource, """
+"""
     }
 
     /**
      * Pure extractive fallback — no LLM needed.
-     *
-     * IMPROVED: Now searches ALL chunks (not just first) for the best
-     * matching sentence. With diversified search results, we might have
-     * chunks from 3 different documents — the best sentence could be
-     * in any of them.
      */
     private fun buildExtractiveAnswer(query: String, contextChunks: List<DocumentChunk>): String {
         if (contextChunks.isEmpty()) return "No relevant information found."
 
         val queryWords = query.lowercase().split(Regex("\\s+")).toSet()
 
-        // Search ALL chunks for the best matching sentence, not just the first
         var bestSentence: String? = null
         var bestScore = -1
         var bestSource: String? = null
@@ -405,21 +380,18 @@ Based on $topSource, """
         return if (bestSentence != null && bestSource != null) {
             "From $bestSource: $bestSentence."
         } else {
-            // Last resort: just show beginning of top chunk
             val topChunk = contextChunks.first()
             topChunk.text.take(200).trim() + "..."
         }
     }
 
     /**
-     * Detect repetition loops — a common failure mode for small models.
-     * If any 8+ word phrase repeats 3+ times, it's a loop.
+     * Detect repetition loops.
      */
     private fun hasRepetitionLoop(text: String): Boolean {
         val words = text.split(Regex("\\s+"))
         if (words.size < 24) return false
 
-        // Check for repeated 8-word sequences
         val windowSize = 8
         val sequences = mutableMapOf<String, Int>()
 
@@ -434,7 +406,7 @@ Based on $topSource, """
     }
 
     /**
-     * Clean up the model's response by removing artifacts.
+     * Clean up the model's response.
      */
     private fun cleanResponse(response: String): String {
         return response
@@ -443,15 +415,18 @@ Based on $topSource, """
             .replace("<start_of_turn>", "")
             .replace("model\n", "")
             .replace(Regex("^\\s*Answer:\\s*"), "")
-            .replace(Regex("^\\s*Based on the sources:\\s*"), "")
+            .replace(Regex("^\\s*Based on the sources?:?\\s*"), "")
+            .replace(Regex("^\\s*According to the sources?:?\\s*"), "")
             .trim()
     }
 
     fun isReady(): Boolean = isInitialized && llmInference != null
 
+    fun isUpgradedModel(): Boolean = true
+
     fun getModelInfo(): String {
-        return if (isInitialized && activeModel != null) {
-            activeModel!!.displayName
+        return if (isInitialized) {
+            MODEL_DISPLAY_NAME
         } else {
             "Loading..."
         }
@@ -462,7 +437,6 @@ Based on $topSource, """
             llmInference?.close()
             llmInference = null
             isInitialized = false
-            activeModel = null
             Log.d(TAG, "LLM service closed")
         } catch (e: Exception) {
             Log.e(TAG, "Error closing LLM service", e)
