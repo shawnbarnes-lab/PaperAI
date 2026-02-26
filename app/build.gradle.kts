@@ -43,51 +43,34 @@ android {
         compose = true
     }
 
-    // Allow large asset files (for the 529MB model)
     androidResources {
         noCompress += listOf("task")
     }
 
-    // Increase APK size limit awareness
     packaging {
         jniLibs {
             useLegacyPackaging = true
         }
     }
-
-    // Play Asset Delivery for large model file
-    assetPacks += ":model_pack"
 }
 
 dependencies {
-    // Core Android
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
 
-    // Compose
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
 
-    // ViewModel
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
-
-    // ObjectBox for vector database
     implementation("io.objectbox:objectbox-kotlin:4.0.3")
-
-    // ONNX Runtime for embeddings
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
-
-    // MediaPipe for LLM inference
-    implementation("com.google.mediapipe:tasks-genai:0.10.22")
-
-    // Coroutines
+    implementation("com.google.mediapipe:tasks-genai:0.10.32")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

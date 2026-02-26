@@ -12,22 +12,22 @@ import java.io.FileOutputStream
 /**
  * LlmService handles on-device LLM inference using MediaPipe's LLM Inference API.
  *
- * v3.0 — Gemma 2B int4
- * - Upgraded from 1B to 2B for much better instruction following
- * - Better source citation and paraphrasing
- * - Can actually refuse when sources don't contain an answer
- * - Tuned prompts for 2B model's stronger capabilities
+ * v4.0 — Gemma 2B Q8 — Tuned for fuller, refined responses
+ * - Increased token limits for complete answers
+ * - Refined prompts for better instruction following
+ * - Better source attribution
+ * - Improved response cleaning
  */
 class LlmService(private val context: Context) {
 
     companion object {
         private const val TAG = "LlmService"
-        private const val MAX_TOKENS = 1024
-        private const val MAX_CONTEXT_CHARS = 2000
-        private const val MAX_CHUNK_CHARS = 500
+        private const val MAX_TOKENS = 2048          // ← Doubled from 1024
+        private const val MAX_CONTEXT_CHARS = 3000    // ← Increased from 2000
+        private const val MAX_CHUNK_CHARS = 600       // ← Increased from 500
         private const val MODEL_ASSET_PATH = "models/gemma-2b-int4.task"
         private const val MODEL_FILE_NAME = "gemma-2b-int4.task"
-        private const val MODEL_DISPLAY_NAME = "Gemma 2B (int4)"
+        private const val MODEL_DISPLAY_NAME = "Gemma 2B (Q8)"
         private const val MIN_RAM_MB = 4096L
     }
 
@@ -66,6 +66,7 @@ class LlmService(private val context: Context) {
                 .setModelPath(modelPath!!)
                 .setMaxTokens(MAX_TOKENS)
                 .setPreferredBackend(LlmInference.Backend.CPU)
+                  // ← Low temp = more focused/factual
                 .build()
 
             Log.d(TAG, "Loading LLM model (this may take 10-30 seconds)...")
@@ -82,9 +83,6 @@ class LlmService(private val context: Context) {
         }
     }
 
-    /**
-     * Check if device has enough RAM.
-     */
     private fun hasEnoughRam(): Boolean {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
@@ -97,9 +95,6 @@ class LlmService(private val context: Context) {
         return totalRamMb >= MIN_RAM_MB
     }
 
-    /**
-     * Check if the model asset exists.
-     */
     private fun isModelAvailable(): Boolean {
         val localExists = File(context.filesDir, MODEL_FILE_NAME).exists()
         val assetExists = try {
@@ -113,9 +108,6 @@ class LlmService(private val context: Context) {
         return assetExists || localExists
     }
 
-    /**
-     * Copy model from assets to internal storage.
-     */
     private fun copyModelFromAssets(): File? {
         try {
             val modelFile = File(context.filesDir, MODEL_FILE_NAME)
@@ -156,7 +148,7 @@ class LlmService(private val context: Context) {
     }
 
     /**
-     * Generate a FULL response.
+     * Generate a FULL detailed response.
      */
     suspend fun generate(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -177,7 +169,7 @@ class LlmService(private val context: Context) {
                 val response = llmInference!!.generateResponse(prompt)
                 val elapsed = System.currentTimeMillis() - startTime
 
-                Log.d(TAG, "Response generated in ${elapsed}ms")
+                Log.d(TAG, "Response generated in ${elapsed}ms (${response.length} chars)")
                 cleanResponse(response)
 
             } catch (e: Exception) {
@@ -187,7 +179,7 @@ class LlmService(private val context: Context) {
         }
 
     /**
-     * Generate a BRIEF 2-3 sentence summary — the primary RAG mode.
+     * Generate a focused 3-5 sentence summary — the primary RAG mode.
      */
     suspend fun generateBrief(query: String, contextChunks: List<DocumentChunk>): String =
         withContext(Dispatchers.IO) {
@@ -207,18 +199,18 @@ class LlmService(private val context: Context) {
                 val response = llmInference!!.generateResponse(prompt)
                 val elapsed = System.currentTimeMillis() - startTime
 
-                Log.d(TAG, "Brief response in ${elapsed}ms: '${response.take(120)}'")
+                Log.d(TAG, "Brief response in ${elapsed}ms (${response.length} chars)")
 
                 val cleaned = cleanResponse(response)
 
                 when {
-                    cleaned.length < 5 -> {
+                    cleaned.length < 10 -> {
                         Log.w(TAG, "Brief response too short (${cleaned.length} chars), extractive fallback")
                         buildExtractiveAnswer(query, contextChunks)
                     }
-                    cleaned.length > 800 -> {
-                        Log.w(TAG, "Brief response too long (${cleaned.length} chars), extractive fallback")
-                        buildExtractiveAnswer(query, contextChunks)
+                    cleaned.length > 1200 -> {
+                        Log.w(TAG, "Brief response too long (${cleaned.length} chars), trimming")
+                        trimToCompleteSentences(cleaned, 1000)
                     }
                     hasRepetitionLoop(cleaned) -> {
                         Log.w(TAG, "Brief response has repetition loop, extractive fallback")
@@ -281,15 +273,15 @@ class LlmService(private val context: Context) {
     }
 
     // ============================================================================
-    // PROMPT ENGINEERING — Tuned for Gemma 2B
+    // PROMPT ENGINEERING — Tuned for Gemma 2B Q8 (fuller, more refined responses)
     // ============================================================================
 
     /**
-     * Full RAG prompt — 2B can handle complex instructions reliably.
+     * Full RAG prompt — detailed, comprehensive answer with source citations.
      */
     private fun buildRagPrompt(query: String, contextChunks: List<DocumentChunk>): String {
-        val contextText = contextChunks.take(4).mapIndexed { index, chunk ->
-            val label = chunk.sourceName.take(50)
+        val contextText = contextChunks.take(5).mapIndexed { index, chunk ->
+            val label = chunk.sourceName.take(60)
             val section = if (chunk.sectionTitle.isNotBlank()) " — ${chunk.sectionTitle}" else ""
             val truncatedText = chunk.text.take(MAX_CHUNK_CHARS)
             "[Source ${index + 1}: $label$section, Page ${chunk.pageNumber}]\n$truncatedText"
@@ -302,31 +294,35 @@ class LlmService(private val context: Context) {
         }
 
         return """<start_of_turn>user
-You are a document research assistant. Your job is to answer questions using ONLY the provided source documents. Follow these rules strictly:
+You are a precise document research assistant. Answer the question thoroughly using ONLY the provided sources.
 
-1. ONLY use information found in the sources below. Never use outside knowledge.
-2. If the sources do not contain enough information to answer, say: "The loaded documents do not contain information about this topic."
-3. Mention which source the information comes from.
-4. Be concise and factual. No speculation or assumptions.
-5. If multiple sources are relevant, synthesize information from all of them.
+Instructions:
+1. Use ONLY information from the sources below. Never add outside knowledge.
+2. If the sources don't contain the answer, say: "The loaded documents do not contain information about this topic."
+3. Reference which source the information comes from (e.g., "According to Source 1...").
+4. Provide a complete, well-structured answer. Include relevant details, examples, and explanations found in the sources.
+5. If multiple sources contain relevant information, synthesize them into a coherent answer.
+6. Use direct quotes from the sources when they are particularly relevant.
 
 SOURCES:
 $finalContext
 
 QUESTION: $query
+
+Provide a thorough, well-organized answer with source citations:
 <end_of_turn>
 <start_of_turn>model
 """
     }
 
     /**
-     * Brief prompt — 2-3 sentence answer with source citation.
+     * Brief prompt — focused 3-5 sentence answer with source citation.
      */
     private fun buildBriefPrompt(query: String, contextChunks: List<DocumentChunk>): String {
-        val contextText = contextChunks.take(3).mapIndexed { index, chunk ->
-            val label = chunk.sourceName.take(50)
+        val contextText = contextChunks.take(4).mapIndexed { index, chunk ->
+            val label = chunk.sourceName.take(60)
             val section = if (chunk.sectionTitle.isNotBlank()) " — ${chunk.sectionTitle}" else ""
-            "[${label}${section}, p.${chunk.pageNumber}] ${chunk.text.take(400)}"
+            "[Source ${index + 1}: ${label}${section}, p.${chunk.pageNumber}]\n${chunk.text.take(500)}"
         }.joinToString("\n---\n")
 
         return """<start_of_turn>user
@@ -335,13 +331,16 @@ You are a document research assistant. Answer the question using ONLY the source
 Rules:
 - Use ONLY facts from the sources. Do not add outside knowledge.
 - If the answer is not in the sources, say "This is not covered in the loaded documents."
-- Mention the source name in your answer.
-- Keep your answer to 2-3 sentences maximum.
+- Mention which source the information comes from.
+- Give a focused answer in 3-5 complete sentences.
+- Include specific details, numbers, or key terms from the sources.
 
 Sources:
 $contextText
 
 Question: $query
+
+Answer in 3-5 sentences with source references:
 <end_of_turn>
 <start_of_turn>model
 """
@@ -355,11 +354,13 @@ Question: $query
 
         val queryWords = query.lowercase().split(Regex("\\s+")).toSet()
 
-        var bestSentence: String? = null
-        var bestScore = -1
-        var bestSource: String? = null
+        val scoredSentences = mutableListOf<Triple<String, Int, String>>()
 
         for (chunk in contextChunks.take(5)) {
+            val sourceName = chunk.sourceName
+                .replace(".pdf", "")
+                .replace("_", " ")
+
             val sentences = chunk.text
                 .split(Regex("[.!?]+\\s+"))
                 .filter { it.length > 20 }
@@ -367,21 +368,43 @@ Question: $query
             for (sentence in sentences) {
                 val sentenceWords = sentence.lowercase().split(Regex("\\s+")).toSet()
                 val score = queryWords.intersect(sentenceWords).size
-                if (score > bestScore) {
-                    bestScore = score
-                    bestSentence = sentence.trim()
-                    bestSource = chunk.sourceName
-                        .replace(".pdf", "")
-                        .replace("_", " ")
-                }
+                scoredSentences.add(Triple(sentence.trim(), score, sourceName))
             }
         }
 
-        return if (bestSentence != null && bestSource != null) {
-            "From $bestSource: $bestSentence."
+        // Get top 2-3 most relevant sentences
+        val topSentences = scoredSentences
+            .sortedByDescending { it.second }
+            .take(3)
+            .filter { it.second > 0 }
+
+        return if (topSentences.isNotEmpty()) {
+            val mainSource = topSentences.first().third
+            val combined = topSentences.joinToString(". ") { it.first }
+            "From $mainSource: $combined."
         } else {
             val topChunk = contextChunks.first()
-            topChunk.text.take(200).trim() + "..."
+            topChunk.text.take(300).trim() + "..."
+        }
+    }
+
+    /**
+     * Trim text to complete sentences within a character limit.
+     */
+    private fun trimToCompleteSentences(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text
+
+        val truncated = text.take(maxChars)
+        val lastPeriod = truncated.lastIndexOf('.')
+        val lastExclamation = truncated.lastIndexOf('!')
+        val lastQuestion = truncated.lastIndexOf('?')
+
+        val lastSentenceEnd = maxOf(lastPeriod, lastExclamation, lastQuestion)
+
+        return if (lastSentenceEnd > maxChars / 2) {
+            truncated.take(lastSentenceEnd + 1).trim()
+        } else {
+            truncated.trim() + "..."
         }
     }
 
@@ -392,7 +415,7 @@ Question: $query
         val words = text.split(Regex("\\s+"))
         if (words.size < 24) return false
 
-        val windowSize = 8
+        val windowSize = 6
         val sequences = mutableMapOf<String, Int>()
 
         for (i in 0..words.size - windowSize) {
@@ -409,15 +432,29 @@ Question: $query
      * Clean up the model's response.
      */
     private fun cleanResponse(response: String): String {
-        return response
+        var cleaned = response
             .replace("<end_of_turn>", "")
             .replace("<eos>", "")
             .replace("<start_of_turn>", "")
+            .replace("<bos>", "")
             .replace("model\n", "")
-            .replace(Regex("^\\s*Answer:\\s*"), "")
-            .replace(Regex("^\\s*Based on the sources?:?\\s*"), "")
-            .replace(Regex("^\\s*According to the sources?:?\\s*"), "")
+            .replace(Regex("^\\s*Answer:\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("^\\s*Response:\\s*", RegexOption.IGNORE_CASE), "")
             .trim()
+
+        // Remove any trailing incomplete sentence
+        if (cleaned.isNotEmpty() && !cleaned.last().let { it == '.' || it == '!' || it == '?' || it == '"' }) {
+            val lastSentenceEnd = maxOf(
+                cleaned.lastIndexOf('.'),
+                cleaned.lastIndexOf('!'),
+                cleaned.lastIndexOf('?')
+            )
+            if (lastSentenceEnd > cleaned.length / 2) {
+                cleaned = cleaned.take(lastSentenceEnd + 1).trim()
+            }
+        }
+
+        return cleaned
     }
 
     fun isReady(): Boolean = isInitialized && llmInference != null
